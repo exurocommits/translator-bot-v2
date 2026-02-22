@@ -1,10 +1,10 @@
-import TelegramBot from 'node-telegram-bot-api';
 import express from 'express';
+import TelegramBot from 'node-telegram-bot-api';
+import { logRequest, logError, logBotEvent } from './lib/logger';
 import { UserService, TranslationService } from './services/user';
 import { SUPPORTED_LANGUAGES, SUBSCRIPTION_TIERS } from './types';
 import { detectLanguage } from './services/llm';
-import { createCheckoutSession, createCustomer } from './services/stripe';
-import { handleWebhook } from './services/stripe';
+import { createCheckoutSession, createCustomer, handleWebhook } from './services/stripe';
 import Stripe from 'stripe';
 
 const app = express();
@@ -16,13 +16,26 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN!, { polling: true });
 const userService = new UserService();
 const translationService = new TranslationService();
 
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
 // Pending translations state
 const pendingTranslations = new Map<number, { targetLang: string; sourceText: string }>();
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+  });
+});
 
 // Command: /start
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const user = await userService.getOrCreateUser(msg.chat.id, msg.from?.username);
+
+  logBotEvent('start_command', { chatId, userId: user.id });
 
   const welcomeMessage = `
 🌍 *Welcome to AI Translator Bot!*
@@ -30,7 +43,7 @@ bot.onText(/\/start/, async (msg) => {
 *Your Status:*
 • Tier: ${user.tier.toUpperCase()}
 • Credits: ${user.credits_remaining.toLocaleString()}
-• Total translations: ${user.total_translations}
+• Total translations: ${user.total_translations.toLocaleString()}
 
 *What I can do:*
 📝 Translate text between 100+ languages
@@ -103,7 +116,7 @@ bot.onText(/\/lang/, (msg) => {
 ${langList}
 
 *Language codes:*
-Use the code when prompted:
+Use to code when prompted:
 en, es, fr, de, it, pt, ru, ja, ko, zh, ar, hi, tr, nl, pl, vi, th, id, ms, sv
   `;
 
@@ -114,6 +127,8 @@ en, es, fr, de, it, pt, ru, ja, ko, zh, ar, hi, tr, nl, pl, vi, th, id, ms, sv
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
   const user = await userService.getOrCreateUser(msg.chat.id, msg.from?.username);
+
+  logBotEvent('status_command', { chatId, userId: user.id, tier: user.tier });
 
   const statusMessage = `
 📊 *Your Account Status*
@@ -129,7 +144,7 @@ ${user.tier === 'free' ? '💰 *Upgrade to Pro:* 10,000 credits/month' : ''}
 
 ${user.stripe_customer_id ? '✅ Premium Member' : '🆓 Free Tier'}
 
-*Last Updated:* ${new Date(user.updated_at).toLocaleString()}
+*Last Updated:* ${new Date(user.updated_at).toLocaleDateString()}
   `;
 
   bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
@@ -168,7 +183,7 @@ bot.onText(/\/upgrade/, async (msg) => {
 • Dedicated support
 
 *Ready to upgrade?*
-1. Click the button below
+1. Click on button below
 2. Complete payment via Stripe
 3. Credits added instantly!
   `;
@@ -197,9 +212,11 @@ bot.on('callback_query', async (query) => {
     const tier = data === 'upgrade_pro' ? 'pro' : 'enterprise';
     const user = await userService.getOrCreateUser(chatId, query.from?.username);
 
+    logBotEvent('upgrade_click', { chatId, userId: user.id, tier });
+
     try {
       if (!user.stripe_customer_id) {
-        const customerId = await createUserCustomer(chatId, query.from);
+        const customerId = await createCustomer(chatId, query.from);
         await userService.updateStripeInfo(user.id, customerId);
       }
 
@@ -214,21 +231,19 @@ bot.on('callback_query', async (query) => {
         `🔗 [Click here to complete your ${tier.toUpperCase()} upgrade](${checkoutUrl})`,
         { parse_mode: 'Markdown', disable_web_page_preview: true }
       );
-    } catch (error) {
+    } catch (error: any) {
+      logError(error as Error, 'upgrade_checkout');
       bot.answerCallbackQuery(query.id, { text: 'Error creating checkout link' });
     }
   }
 });
 
-async function createUserCustomer(chatId: number, from: any): Promise<string> {
-  const email = `${from.username || chatId}@telegram.bot`;
-  return await createCustomer(email, chatId);
-}
-
 // Command: /history
 bot.onText(/\/history/, async (msg) => {
   const chatId = msg.chat.id;
   const user = await userService.getOrCreateUser(msg.chat.id, msg.from?.username);
+
+  logBotEvent('history_command', { chatId, userId: user.id });
 
   const history = await translationService.getHistory(user.id, 5);
 
@@ -256,6 +271,8 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
+  logBotEvent('text_message', { chatId, textLength: text.length });
+
   // If there's a pending translation
   if (pendingTranslations.has(chatId)) {
     const pending = pendingTranslations.get(chatId)!;
@@ -278,12 +295,15 @@ bot.on('message', async (msg) => {
         targetLang
       );
 
+      logBotEvent('translation_complete', { chatId, userId: user.id, tokensUsed, targetLang });
+
       bot.sendMessage(
         chatId,
         `✅ *Translation Complete*\n\n*Original (${pending.targetLang}):*\n${pending.sourceText}\n\n*Translated (${targetLang.toUpperCase()}):*\n${translatedText}\n\n📊 Tokens used: ${tokensUsed} | Credits remaining: ${user.credits_remaining}`,
         { parse_mode: 'Markdown' }
       );
     } catch (error: any) {
+      logError(error as Error, 'translation_error');
       bot.sendMessage(chatId, `❌ Error: ${error.message}`);
     }
 
@@ -331,6 +351,8 @@ bot.on('callback_query', async (query) => {
         targetLang
       );
 
+      logBotEvent('translation_complete', { chatId, userId: user.id, tokensUsed, targetLang });
+
       bot.answerCallbackQuery(query.id);
       bot.sendMessage(
         chatId,
@@ -338,6 +360,7 @@ bot.on('callback_query', async (query) => {
         { parse_mode: 'Markdown' }
       );
     } catch (error: any) {
+      logError(error as Error, 'translation_error');
       bot.answerCallbackQuery(query.id, { text: 'Error: ' + error.message });
       bot.sendMessage(chatId, `❌ ${error.message}`);
     }
@@ -348,6 +371,8 @@ bot.on('callback_query', async (query) => {
 
 // Stripe webhook endpoint
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  logRequest(req);
+
   const sig = req.headers['stripe-signature'] as string;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
 
@@ -356,9 +381,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
+    logError(err as Error, 'webhook_verification');
     res.status(400).send(`Webhook Error: ${err}`);
     return;
   }
+
+  logBotEvent('webhook_received', { type: event.type });
 
   await handleWebhook(event);
   res.json({ received: true });

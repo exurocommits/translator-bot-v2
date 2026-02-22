@@ -1,3 +1,5 @@
+import { supabase } from '../lib/supabase';
+import { updateUserSubscription } from './stripe-db';
 import Stripe from 'stripe';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
@@ -55,7 +57,6 @@ export async function handleWebhook(event: Stripe.Event): Promise<void> {
       const customerId = session.customer as string;
       const subscriptionId = session.subscription as string;
 
-      // Update user in database
       await updateUserSubscription(customerId, subscriptionId, 'active');
       break;
     }
@@ -85,14 +86,4 @@ export async function handleWebhook(event: Stripe.Event): Promise<void> {
       break;
     }
   }
-}
-
-async function updateUserSubscription(
-  customerId: string,
-  subscriptionId: string,
-  status: string
-): Promise<void> {
-  // This would update the database - implement based on your schema
-  // Import your database client here
-  console.log(`Updating user ${customerId}: subscription ${subscriptionId} -> ${status}`);
 }
